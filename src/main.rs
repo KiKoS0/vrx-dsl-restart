@@ -1,23 +1,29 @@
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::time::{self, Duration};
 
 //TODO: Tone it down to only get the last X lines or figure out how to stream from the file.
-fn execute() -> bool {
+async fn execute() -> bool {
     let mut cmd = Command::new("dmesg")
-        .stdout(Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .unwrap();
+
     let restart_msg_flag = "Restarted DSL connection";
     let showtime_enter_flag = "vrx518_tc:ptm_showtime_enter";
     let showtime_exit_flag = "vrx518_tc:ptm_showtime_exit";
 
     let stdout = cmd.stdout.as_mut().unwrap();
-    let stdout_reader = BufReader::new(stdout);
-    let stdout_lines = stdout_reader.lines();
+    let mut stdout_reader = BufReader::new(stdout).lines();
 
-    let lines: Vec<String> = stdout_lines.map(|line| line.unwrap()).collect();
+    let mut lines: Vec<String> = Vec::new();
+    while let Some(line) = stdout_reader.next_line().await.unwrap() {
+        lines.push(line);
+    }
+
     for line in lines.iter().rev() {
         if line.contains(restart_msg_flag) || line.contains(showtime_enter_flag) {
             dbg_print_to_kernel_log("Skipping because of restart or showtime enter flag");
@@ -25,22 +31,21 @@ fn execute() -> bool {
         }
 
         if line.contains(showtime_exit_flag) {
-            restart_dsl_connection();
-
+            restart_dsl_connection().await;
             print_to_kernel_log(restart_msg_flag);
-
             dbg_print_to_kernel_log("Sleeping for 60 seconds");
-            std::thread::sleep(std::time::Duration::from_secs(60));
+
+            time::sleep(Duration::from_secs(60)).await;
             return true;
         }
     }
 
-    cmd.wait().unwrap();
+    cmd.wait().await.unwrap();
 
     false
 }
 
-fn restart_dsl_connection() {
+async fn restart_dsl_connection() {
     let cmds = vec![
         "/etc/init.d/dsl_control stop",
         "service tailscale stop",
@@ -67,33 +72,35 @@ fn restart_dsl_connection() {
     ];
 
     for cmd in cmds.iter() {
-        let mut cmd = Command::new("sh")
+        let mut child = Command::new("sh")
             .arg("-c")
             .arg(cmd)
-            .stdout(Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .unwrap();
 
-        let stdout = cmd.stdout.as_mut().unwrap();
-        let stdout_reader = BufReader::new(stdout);
-        let stdout_lines = stdout_reader.lines();
+        if let Some(stdout) = child.stdout.take() {
+            let mut stdout_reader = BufReader::new(stdout).lines();
 
-        for line in stdout_lines {
-            dbg_print_to_kernel_log(line.unwrap().as_str());
+            while let Ok(Some(line)) = stdout_reader.next_line().await {
+                dbg_print_to_kernel_log(&line);
+            }
         }
 
-        cmd.wait().unwrap();
+        child.wait().await.unwrap();
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     loop {
-        if execute() {
+        if execute().await {
             continue;
         }
 
-        dbg_print_to_kernel_log("Sleeping for 10 seconds");
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        dbg_print_to_kernel_log("Sleeping for 10 second");
+        time::sleep(Duration::from_secs(10)).await;
     }
 }
 
